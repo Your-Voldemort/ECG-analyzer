@@ -274,6 +274,93 @@ def predict(model, signal, sampling_rate):
         'all_probs': {name: probs[i].item() for i, name in enumerate(config.CLASS_NAMES)}
     }
 
+
+def build_health_report(results, heart_rate):
+    diagnosis = results['detailed_class']
+    confidence = max(results['all_probs'].values()) * 100
+
+    class_titles = {
+        'NORM': 'Normal ECG Pattern',
+        'MI': 'Myocardial Infarction Pattern',
+        'STTC': 'ST/T Wave Change Pattern',
+        'CD': 'Conduction Disturbance Pattern',
+        'HYP': 'Cardiac Hypertrophy Pattern'
+    }
+
+    if heart_rate < 50:
+        hr_status = "Low heart rate for resting adults"
+    elif heart_rate > 100:
+        hr_status = "High heart rate for resting adults"
+    else:
+        hr_status = "Heart rate in common resting range"
+
+    risk_by_class = {
+        'NORM': 'Low',
+        'MI': 'Urgent',
+        'STTC': 'High',
+        'CD': 'High',
+        'HYP': 'Moderate'
+    }
+    risk_level = risk_by_class.get(diagnosis, 'Moderate')
+
+    if diagnosis == 'NORM' and (heart_rate < 50 or heart_rate > 100):
+        risk_level = 'Moderate'
+
+    assessment_map = {
+        'NORM': "The ECG morphology appears normal in this recording.",
+        'MI': "The ECG pattern may be consistent with a heart attack-related change.",
+        'STTC': "The ECG pattern shows ST/T changes that can indicate cardiac stress or ischemia.",
+        'CD': "The ECG pattern suggests delayed electrical conduction in the heart.",
+        'HYP': "The ECG pattern suggests possible chamber wall thickening or strain."
+    }
+
+    actions_map = {
+        'NORM': [
+            "Continue healthy lifestyle habits (sleep, hydration, exercise, and stress control).",
+            "Repeat ECG if symptoms occur (chest pain, dizziness, palpitations, shortness of breath).",
+            "Share this result during routine doctor visits if you have cardiovascular risk factors."
+        ],
+        'MI': [
+            "Seek emergency care immediately, especially if symptoms are present.",
+            "Do not drive yourself; contact emergency services or ask someone to assist.",
+            "Bring this ECG report and timeline of symptoms to the emergency team."
+        ],
+        'STTC': [
+            "Arrange a same-day or urgent cardiology/medical review.",
+            "Avoid intense physical exertion until medically evaluated.",
+            "Track symptoms and triggers (activity, stress, medications) to share with your clinician."
+        ],
+        'CD': [
+            "Schedule prompt cardiology review and discuss possible rhythm/conduction testing.",
+            "Avoid heavy exertion if you feel faint, dizzy, or unusually fatigued.",
+            "Monitor pulse and symptoms daily until reviewed by a clinician."
+        ],
+        'HYP': [
+            "Book a non-emergency medical review to assess blood pressure and cardiac risk.",
+            "Track blood pressure at home and limit sodium intake.",
+            "Discuss whether echocardiography or further cardiac testing is needed."
+        ]
+    }
+
+    confidence_note = (
+        "High confidence prediction"
+        if confidence >= 80
+        else "Moderate confidence prediction"
+        if confidence >= 60
+        else "Lower confidence prediction; consider repeat recording"
+    )
+
+    return {
+        'risk_level': risk_level,
+        'diagnosis_title': class_titles.get(diagnosis, diagnosis),
+        'confidence': confidence,
+        'heart_rate': heart_rate,
+        'heart_rate_status': hr_status,
+        'assessment': assessment_map.get(diagnosis, "Pattern detected; clinical review recommended."),
+        'actions': actions_map.get(diagnosis, ["Discuss this ECG result with a healthcare professional."]),
+        'confidence_note': confidence_note
+    }
+
 def plot_ecg(signal, fs=100):
     time = np.arange(len(signal)) / fs
     fig, ax = plt.subplots(figsize=(14, 3.5))
@@ -373,13 +460,46 @@ def main():
                             st.success("✓ Analysis Complete - Normal ECG")
                         else:
                             st.warning(f"⚠ Analysis Complete - {results['detailed_class']} Detected")
+
+                        report = build_health_report(results, hr)
+
+                        st.subheader("Personalized ECG Report")
+                        col1, col2, col3 = st.columns(3)
+                        col1.metric("Risk Level", report['risk_level'])
+                        col2.metric("Heart Rate", f"{report['heart_rate']:.0f} bpm")
+                        col3.metric("Model Confidence", f"{report['confidence']:.1f}%")
+
+                        st.markdown(f"**Finding:** {report['diagnosis_title']}")
+                        st.markdown(f"**Interpretation:** {report['assessment']}")
+                        st.markdown(f"**Heart-rate context:** {report['heart_rate_status']}")
+                        st.markdown(f"**Confidence note:** {report['confidence_note']}")
+
+                        st.markdown("**Actionable steps:**")
+                        for action in report['actions']:
+                            st.markdown(f"- {action}")
+
+                        prob_df = pd.DataFrame(
+                            [
+                                {
+                                    'Class': class_name,
+                                    'Probability (%)': round(prob * 100, 2)
+                                }
+                                for class_name, prob in sorted(
+                                    results['all_probs'].items(),
+                                    key=lambda item: item[1],
+                                    reverse=True
+                                )
+                            ]
+                        )
+                        with st.expander("Model class probabilities"):
+                            st.dataframe(prob_df, use_container_width=True, hide_index=True)
                         
                         st.divider()
                         
                         gemini_model, gemini_error = initialize_gemini()
                         
                         if not gemini_error:
-
+                            st.subheader("AI Assistant Summary")
                             analysis = analyze_with_gemini(gemini_model, results, signal, fs)
                             if analysis:
                                 st.markdown(analysis)
