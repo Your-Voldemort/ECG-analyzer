@@ -5,6 +5,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
+from io import BytesIO
+from datetime import datetime
+from matplotlib.backends.backend_pdf import PdfPages
 
 try:
     import google.generativeai as genai
@@ -267,15 +270,94 @@ def predict(model, signal, sampling_rate):
     
     pred_idx = probs.argmax().item()
     pred_name = config.CLASS_NAMES[pred_idx]
+    sorted_probs = torch.sort(probs, descending=True).values
+    top_probability = sorted_probs[0].item()
+    second_probability = sorted_probs[1].item() if len(sorted_probs) > 1 else 0.0
     
     return {
         'is_normal': pred_name == "NORM",
         'detailed_class': pred_name,
-        'all_probs': {name: probs[i].item() for i, name in enumerate(config.CLASS_NAMES)}
+        'all_probs': {name: probs[i].item() for i, name in enumerate(config.CLASS_NAMES)},
+        'top_probability': top_probability,
+        'prediction_margin': top_probability - second_probability
     }
 
 
-def build_health_report(results, heart_rate):
+def assess_signal_quality(signal, fs):
+    signal = np.asarray(signal, dtype=np.float32)
+    score = 100
+    issues = []
+    tips = []
+
+    if len(signal) < fs * 8:
+        score -= 20
+        issues.append("Recording is short for reliable rhythm interpretation")
+        tips.append("Record at least 10 seconds of stable ECG while staying still")
+
+    finite_mask = np.isfinite(signal)
+    if not finite_mask.all():
+        score -= 35
+        issues.append("Signal contains invalid values")
+        tips.append("Re-export the file and verify the ECG column has numeric values only")
+        signal = signal[finite_mask]
+
+    if len(signal) == 0:
+        return {
+            'score': 0,
+            'grade': 'Poor',
+            'issues': ["No valid ECG samples found"],
+            'tips': ["Upload a valid CSV with one ECG signal column"]
+        }
+
+    dynamic_range = float(np.percentile(signal, 95) - np.percentile(signal, 5))
+    if dynamic_range < 0.08:
+        score -= 25
+        issues.append("Very low signal amplitude (possible weak contact/flat trace)")
+        tips.append("Tighten watch contact and keep your hand still during recording")
+
+    signal_std = float(np.std(signal))
+    if signal_std < 0.02:
+        score -= 20
+        issues.append("Low variability detected (possible flatline segment)")
+
+    if len(signal) > 1:
+        diff_std = float(np.std(np.diff(signal)))
+        noise_ratio = diff_std / (signal_std + 1e-8)
+        if noise_ratio > 1.4:
+            score -= 20
+            issues.append("High noise level detected")
+            tips.append("Retake in a quiet posture and avoid movement/talking")
+
+    sig_min, sig_max = float(np.min(signal)), float(np.max(signal))
+    if sig_max > sig_min:
+        near_clip = ((np.abs(signal - sig_max) < 1e-6) | (np.abs(signal - sig_min) < 1e-6)).mean()
+        if near_clip > 0.02:
+            score -= 15
+            issues.append("Potential clipping at signal limits")
+            tips.append("Check device fit and avoid pressing too hard on the sensor")
+
+    edge_len = max(1, int(0.1 * len(signal)))
+    edge_shift = abs(float(np.mean(signal[:edge_len]) - np.mean(signal[-edge_len:])))
+    if edge_shift > (0.7 * (signal_std + 1e-8)):
+        score -= 10
+        issues.append("Baseline drift detected")
+        tips.append("Keep wrist and finger position stable throughout recording")
+
+    score = int(max(0, min(100, score)))
+    grade = 'Good' if score >= 80 else 'Fair' if score >= 60 else 'Poor'
+
+    if not tips:
+        tips.append("Current signal quality appears acceptable for screening")
+
+    return {
+        'score': score,
+        'grade': grade,
+        'issues': list(dict.fromkeys(issues)),
+        'tips': list(dict.fromkeys(tips))
+    }
+
+
+def build_health_report(results, heart_rate, quality, uncertain=False, uncertain_reasons=None):
     diagnosis = results['detailed_class']
     confidence = max(results['all_probs'].values()) * 100
 
@@ -302,6 +384,9 @@ def build_health_report(results, heart_rate):
         'HYP': 'Moderate'
     }
     risk_level = risk_by_class.get(diagnosis, 'Moderate')
+
+    if uncertain:
+        risk_level = 'Moderate' if quality['grade'] != 'Poor' else 'High'
 
     if diagnosis == 'NORM' and (heart_rate < 50 or heart_rate > 100):
         risk_level = 'Moderate'
@@ -350,16 +435,82 @@ def build_health_report(results, heart_rate):
         else "Lower confidence prediction; consider repeat recording"
     )
 
+    if uncertain:
+        diagnosis_title = "Uncertain result - retake recommended"
+        assessment = "Model confidence/signal quality is not strong enough for a reliable single-label conclusion."
+        actions = [
+            "Retake ECG while seated, relaxed, and motionless for at least 10 seconds.",
+            "Ensure good skin contact and repeat the recording 1-2 times.",
+            "If symptoms are present (chest pain, fainting, breathlessness), seek medical care now."
+        ]
+        if uncertain_reasons:
+            confidence_note = "Uncertain due to: " + "; ".join(uncertain_reasons)
+    else:
+        diagnosis_title = class_titles.get(diagnosis, diagnosis)
+        assessment = assessment_map.get(diagnosis, "Pattern detected; clinical review recommended.")
+        actions = actions_map.get(diagnosis, ["Discuss this ECG result with a healthcare professional."])
+
     return {
         'risk_level': risk_level,
-        'diagnosis_title': class_titles.get(diagnosis, diagnosis),
+        'diagnosis_title': diagnosis_title,
         'confidence': confidence,
         'heart_rate': heart_rate,
         'heart_rate_status': hr_status,
-        'assessment': assessment_map.get(diagnosis, "Pattern detected; clinical review recommended."),
-        'actions': actions_map.get(diagnosis, ["Discuss this ECG result with a healthcare professional."]),
-        'confidence_note': confidence_note
+        'assessment': assessment,
+        'actions': actions,
+        'confidence_note': confidence_note,
+        'quality_score': quality['score'],
+        'quality_grade': quality['grade']
     }
+
+
+def generate_pdf_report(report, results, quality, source, fs):
+    buffer = BytesIO()
+
+    lines = [
+        "ECG Analyzer Report",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Data source: {source}",
+        f"Sampling rate: {fs} Hz",
+        "",
+        f"Risk level: {report['risk_level']}",
+        f"Finding: {report['diagnosis_title']}",
+        f"Heart rate: {report['heart_rate']:.0f} bpm ({report['heart_rate_status']})",
+        f"Model confidence: {report['confidence']:.1f}%",
+        f"Signal quality: {quality['grade']} ({quality['score']}/100)",
+        "",
+        "Interpretation:",
+        report['assessment'],
+        "",
+        "Actionable steps:"
+    ]
+
+    for idx, action in enumerate(report['actions'], start=1):
+        lines.append(f"{idx}. {action}")
+
+    lines.append("")
+    lines.append("Class probabilities:")
+    for class_name, prob in sorted(results['all_probs'].items(), key=lambda item: item[1], reverse=True):
+        lines.append(f"- {class_name}: {prob * 100:.2f}%")
+
+    lines.append("")
+    lines.append("Note: This is an AI screening tool and not a medical diagnosis.")
+
+    fig, ax = plt.subplots(figsize=(8.27, 11.69))
+    ax.axis('off')
+    y = 0.98
+    for line in lines:
+        ax.text(0.03, y, line, fontsize=10, va='top', ha='left', wrap=True)
+        y -= 0.03
+        if y < 0.04:
+            break
+
+    with PdfPages(buffer) as pdf:
+        pdf.savefig(fig, bbox_inches='tight')
+    plt.close(fig)
+
+    buffer.seek(0)
+    return buffer.getvalue()
 
 def plot_ecg(signal, fs=100):
     time = np.arange(len(signal)) / fs
@@ -451,23 +602,53 @@ def main():
             if st.button("▶ Analyze My ECG", type="primary", use_container_width=True):
                 with st.spinner("Analyzing your ECG..."):
                     try:
+                        quality = assess_signal_quality(signal, fs)
                         results = predict(model, signal, fs)
                         hr = estimate_heart_rate(signal, fs)
+                        uncertain_reasons = []
+
+                        if results['top_probability'] < 0.60:
+                            uncertain_reasons.append("low prediction confidence")
+                        if results['prediction_margin'] < 0.15:
+                            uncertain_reasons.append("model classes are closely competing")
+                        if quality['grade'] == 'Poor':
+                            uncertain_reasons.append("poor ECG signal quality")
+
+                        uncertain = len(uncertain_reasons) > 0
                         
                         st.divider()
                         
-                        if results['is_normal']:
+                        if uncertain:
+                            st.warning("⚠ Analysis Complete - Uncertain result, please retake ECG for better reliability")
+                        elif results['is_normal']:
                             st.success("✓ Analysis Complete - Normal ECG")
                         else:
                             st.warning(f"⚠ Analysis Complete - {results['detailed_class']} Detected")
 
-                        report = build_health_report(results, hr)
+                        report = build_health_report(
+                            results,
+                            hr,
+                            quality,
+                            uncertain=uncertain,
+                            uncertain_reasons=uncertain_reasons
+                        )
 
                         st.subheader("Personalized ECG Report")
-                        col1, col2, col3 = st.columns(3)
+                        col1, col2, col3, col4 = st.columns(4)
                         col1.metric("Risk Level", report['risk_level'])
                         col2.metric("Heart Rate", f"{report['heart_rate']:.0f} bpm")
                         col3.metric("Model Confidence", f"{report['confidence']:.1f}%")
+                        col4.metric("Signal Quality", f"{report['quality_grade']} ({report['quality_score']}/100)")
+
+                        if quality['issues']:
+                            st.markdown("**Signal quality checks:**")
+                            for issue in quality['issues']:
+                                st.markdown(f"- {issue}")
+
+                        if quality['tips']:
+                            st.markdown("**Retake tips:**")
+                            for tip in quality['tips']:
+                                st.markdown(f"- {tip}")
 
                         st.markdown(f"**Finding:** {report['diagnosis_title']}")
                         st.markdown(f"**Interpretation:** {report['assessment']}")
@@ -493,18 +674,29 @@ def main():
                         )
                         with st.expander("Model class probabilities"):
                             st.dataframe(prob_df, use_container_width=True, hide_index=True)
+
+                        pdf_bytes = generate_pdf_report(report, results, quality, source, fs)
+                        st.download_button(
+                            "Download PDF Report",
+                            data=pdf_bytes,
+                            file_name=f"ecg_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True
+                        )
                         
                         st.divider()
                         
                         gemini_model, gemini_error = initialize_gemini()
                         
-                        if not gemini_error:
+                        if not gemini_error and not uncertain:
                             st.subheader("AI Assistant Summary")
                             analysis = analyze_with_gemini(gemini_model, results, signal, fs)
                             if analysis:
                                 st.markdown(analysis)
                             else:
                                 st.error("AI analysis failed. Please try again.")
+                        elif uncertain:
+                            st.info("AI Assistant Summary skipped because the result is uncertain. Please retake ECG for a clearer interpretation.")
                         
                         with st.expander(" View ECG Signal"):
                             fig_ecg = plot_ecg(signal[:1000], fs)
